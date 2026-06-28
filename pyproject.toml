@@ -21,7 +21,13 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest==9.1.1", "pytest-cov==7.1.0", "coverage==7.14.3"]
+dev = [
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "coverage==7.14.3",
+    "build>=1.2",   # python -m build  -> wheel + sdist
+    "twine>=5.0",   # twine upload     -> publish to PyPI
+]
 
 [project.scripts]
 vortis = "vortis.__main__:main"
