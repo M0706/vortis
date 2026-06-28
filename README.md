@@ -48,6 +48,43 @@ trades breadth for being tiny, readable, and dependency-free.
 
 ---
 
+## How it compares to other Python options
+
+There are good existing tools here, and for several use cases they're the better
+choice — so here's an honest comparison rather than a sales pitch.
+
+| | TTL | Active expiry | Thread-safe | Eviction | Server mode | Deps | Commands |
+|---|---|---|---|---|---|---|---|
+| **`dict`** | ❌ | ❌ | ❌ | ❌ | ❌ | none | n/a |
+| **`cachetools`** | ✅ | ❌ (lazy only) | ❌ (by default) | ✅ LRU/LFU/TTL | ❌ | none | n/a |
+| **`fakeredis`** | ✅ | partial | ✅ | ✅ | ❌ (emulates) | a few | **hundreds** |
+| **redis-py + Redis** | ✅ | ✅ | ✅ (server) | ✅ | ✅ (real) | redis-py + a server | hundreds |
+| **vortis** | ✅ | ✅ (background) | ✅ (default) | ✅ (Random) | ✅ (RESP) | **none** | **5** |
+
+**Where vortis is genuinely different:** it's the only one of these that is *both*
+an in-process library *and* a RESP server from **one zero-dependency codebase**,
+with **active background expiry** and **thread-safety on by default**. That's a
+real niche — "a self-cleaning, bounded, thread-safe dict with TTL that I can also
+expose over the wire, with nothing to install."
+
+**Where the others win — use them instead when:**
+
+- **You want a mature pure-Python cache** → [`cachetools`](https://pypi.org/project/cachetools/)
+  is more complete for in-process caching (rich LRU/LFU/TTL caches, decorators).
+  vortis's edges over it are *active* expiry (cachetools only evicts lazily on
+  access) and thread-safety by default — but cachetools is the more battle-tested
+  library for the plain-cache job.
+- **You want a fake Redis for tests** → [`fakeredis`](https://pypi.org/project/fakeredis/)
+  implements *hundreds* of commands and is a drop-in for redis-py. vortis has 5
+  commands; it is **not** a substitute here.
+- **You need real Redis behavior, persistence, or scale** → use
+  [redis-py](https://pypi.org/project/redis/) against an actual Redis/Valkey.
+
+In short: reach for vortis when "zero dependencies, in-process *and* serveable,
+self-expiring" matters more than breadth of features.
+
+---
+
 ## Architecture Overview
 
 The code is layered so the same core can be used **two ways**: imported as an
