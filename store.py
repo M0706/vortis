@@ -30,8 +30,10 @@ import time
 from contextlib import nullcontext
 
 from eviction import EVICTION_SAMPLES, KeyCountSizer, make_policy
+from sweeper import BackgroundSweeper
 
-# Active-expire tuning (mirrors Redis's activeExpireCycle constants).
+# Active-expire tuning (mirrors Redis's activeExpireCycle constants), used by
+# active_expire_cycle below.
 KEYS_PER_LOOP = 20       # ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP
 ACCEPTABLE_STALE = 0.25  # continue while >25% of the sample is expired
 
@@ -77,11 +79,14 @@ class Store:
         # not the total keyspace. Kept in sync with `data` on every mutation.
         self.expires: dict[str, float] = {}
 
-        # Background-expiry machinery (created lazily when started).
-        self._expiry_interval = expiry_interval
+        # Background active-expiry runs the cycle periodically on a daemon
+        # thread. The sweeper owns all the threading; Store just hands it the
+        # task to run.
         self._expiry_budget_ms = expiry_budget_ms
-        self._thread: threading.Thread | None = None
-        self._stop = threading.Event()
+        self._sweeper = BackgroundSweeper(
+            expiry_interval,
+            lambda: self.active_expire_cycle(self._expiry_budget_ms),
+            name="store-active-expiry")
 
         # Size bounding (off unless max_size is set). When off, none of the
         # eviction machinery is consulted, so the hot path is untouched.
@@ -96,9 +101,8 @@ class Store:
         # Thread-safety is the default guarantee. A background-expiry daemon
         # always needs the lock; a caller can otherwise opt out when it can
         # prove it is single-threaded (the server), paying zero locking cost.
-        use_lock = thread_safe or active_expiry
-        self._lock: "threading.Lock | nullcontext" = (
-            threading.Lock() if use_lock else nullcontext())
+        self._locking = thread_safe or active_expiry
+        self._lock = threading.Lock() if self._locking else nullcontext()
 
         if active_expiry:
             self.start_expiry()
@@ -301,39 +305,25 @@ class Store:
 
     # -- background expiry lifecycle ----------------------------------------
 
-    def start_expiry(self) -> None:
-        """Start the background daemon thread that runs active expiration.
+    def _ensure_locking(self) -> None:
+        """Promote to a real lock before a second thread can touch the store.
 
-        Idempotent: calling it when already running does nothing. Safe to call
-        once after construction because no other thread exists yet, so swapping
-        in the real lock cannot race.
+        A ``thread_safe=False`` store starts with a no-op lock; if background
+        expiry is later started, a concurrent thread appears and real locking
+        is required. Safe to call before the sweeper thread starts (no race).
         """
-        if self._thread is not None and self._thread.is_alive():
-            return
-        # Upgrade to a real lock now that a second thread is about to exist.
-        if isinstance(self._lock, nullcontext):
+        if not self._locking:
+            self._locking = True
             self._lock = threading.Lock()
-        self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._expiry_loop, name="store-active-expiry", daemon=True)
-        self._thread.start()
+
+    def start_expiry(self) -> None:
+        """Start the background daemon that runs active expiration (idempotent)."""
+        self._ensure_locking()
+        self._sweeper.start()
 
     def stop(self) -> None:
-        """Stop the background expiry thread and wait for it to exit.
-
-        Idempotent; safe to call even if expiry was never started.
-        """
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self._expiry_interval + 1.0)
-            self._thread = None
-
-    def _expiry_loop(self) -> None:  # pragma: no cover - runs on a background thread
-        # Event.wait() sleeps for the interval but returns immediately when
-        # stop() is signalled, so shutdown is prompt rather than waiting out a
-        # full sleep.
-        while not self._stop.wait(self._expiry_interval):
-            self.active_expire_cycle(self._expiry_budget_ms)
+        """Stop the background expiry daemon and wait for it (idempotent)."""
+        self._sweeper.stop()
 
     # -- context manager: ensure the thread is cleaned up -------------------
 

@@ -480,6 +480,7 @@ Every PR into `staging` and `master` must satisfy:
 ├── async_tcp.py             # Non-blocking selector-based TCP server
 ├── sync_tcp.py              # Blocking single-client TCP server (reference)
 ├── resp.py                  # RESP protocol parser and encoder
+├── sweeper.py               # BackgroundSweeper: runs a task periodically on a daemon thread
 ├── eviction/                # Eviction strategies (Strategy pattern)
 │   ├── base.py              #   EvictionPolicy ABC + EVICTION_SAMPLES
 │   ├── sizer.py             #   Sizer ABC + KeyCountSizer
@@ -488,6 +489,7 @@ Every PR into `staging` and `master` must satisfy:
 │       └── random_policy.py #     RandomPolicy
 └── tests/                   # pytest test suite
     ├── test_store.py        # Store library API + thread-safety + background expiry
+    ├── test_sweeper.py      # BackgroundSweeper lifecycle + resilience
     ├── test_protocol.py     # RESP command layer over a Store
     ├── test_eviction.py     # Sizer/policies + bounded-Store integration
     ├── test_async_tcp.py    # Server framing logic
