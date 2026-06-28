@@ -210,39 +210,61 @@ write no synchronization code; it's handled for you.
 > own event loop instead, staying single-threaded. The background sweeper exists
 > specifically for **library** users, who have no loop of their own.
 
-### ⚠️ Mind unbounded growth: TTLs and the no-expiry footgun
+### Bounding memory: `max_size` + eviction
 
-This is an **in-memory** store with **no maximum size**. A key set *without* a
-TTL lives forever — neither passive nor active expiry will ever touch it,
-because it has no expiry to check. That's correct for some uses and dangerous for
-others, so be deliberate:
+By default the store is **unbounded** — it grows until you run out of memory. A
+key set *without* a TTL lives forever (neither passive nor active expiry can
+touch it, since there's no expiry to check), so a cache that keeps writing
+without TTLs will eventually OOM.
 
-- **Using it as a persistent store** (config, flags, primary data that *should*
-  outlive nothing in particular) → no-TTL keys are fine and expected.
-- **Using it as a cache** (sessions, computed results, rate-limit counters) →
-  a no-TTL key is a slow memory leak. If writes outpace reads and keys never
-  expire, the process grows without bound and eventually runs out of memory.
-
-The store will **not** stop you or evict anything for you — there is currently no
-`maxmemory`-style cap. Until one exists, the safe patterns are:
+To put a hard ceiling on the store, pass `max_size`. Once full, each new write
+first **evicts** an existing key to make room (Redis's evict-then-write):
 
 ```python
-# 1. For cache-style use, always set a TTL — make keys mortal by default:
-s.set("session:42", token, ex=3600)        # not s.set("session:42", token)
+from store import Store
 
-# 2. Turn on the background sweeper so expired keys are reclaimed even if
-#    nobody reads them again (see the section above):
-s = Store(active_expiry=True)
-
-# 3. If you must bound the size yourself, cap it explicitly in your own code:
-if len(s) > MAX_KEYS:
-    ...  # evict / refuse / alert — your policy
+s = Store(max_size=10_000, eviction="random")
+# the store never holds more than 10,000 keys; the 10,001st write evicts one first
 ```
 
-> **Rule of thumb:** if the data is a cache, give every key a TTL **and** enable
-> `active_expiry`. If the data is meant to be permanent, no-TTL is correct — just
-> make sure you actually meant "permanent." A built-in size cap with eviction
-> (à la Redis `maxmemory` + `allkeys-lru`) is a natural future addition.
+- **`max_size`** — the cap, measured as a **key count** (a byte-based limit is a
+  planned `Sizer` strategy; see below). `None` (default) = unbounded.
+- **`eviction`** — which key to drop when full. Currently:
+  - `"random"` (default) — evict a random key (Redis's `allkeys-random`).
+  - `"noeviction"` — never evict; the store is allowed to grow past `max_size`
+    (use when you'd rather exceed the limit than lose data).
+
+#### How eviction picks a victim (and why it's cheap)
+
+Eviction **samples a few random keys** and drops one — it never scans the whole
+keyspace. This mirrors Redis's `maxmemory-samples` approach: bounded, predictable
+latency regardless of how many keys you hold. Random eviction in particular adds
+**zero per-key memory and zero per-read overhead** — there's no recency or
+frequency tracking to maintain.
+
+> **Extensible by design.** Eviction is a Strategy: each policy is its own module
+> under `eviction/policies/`, registered in a factory. Adding LRU, LFU, FIFO, or
+> volatile-TTL later means adding a file — never editing `Store`. Random ships
+> first because it's the simplest and cheapest; richer policies are planned.
+
+#### Still want TTLs
+
+`max_size` and TTLs are complementary, not either/or. For cache-style use, the
+robust setup is **all three**:
+
+```python
+s = Store(max_size=100_000, eviction="random", active_expiry=True)
+s.set("session:42", token, ex=3600)   # mortal key + background reclamation + hard cap
+```
+
+- TTLs reclaim keys when they *logically* expire.
+- `active_expiry` reclaims expired keys even if nobody reads them again.
+- `max_size` is the backstop that bounds memory no matter what.
+
+> **Note:** the limit is a **key count** today, not bytes. A 1 MB value and a
+> 10-byte value each count as one key. Byte-based limiting is a planned `Sizer`
+> (the abstraction is already in place); until then, size your `max_size` with
+> your typical value size in mind.
 
 ---
 
@@ -453,14 +475,21 @@ Every PR into `staging` and `master` must satisfy:
 ```
 .
 ├── main.py                  # Entry point — starts the async server
-├── store.py                 # Store: in-memory KV core (TTL, expiry, thread-safety)
+├── store.py                 # Store: in-memory KV core (TTL, expiry, thread-safety, bounding)
 ├── protocol.py              # RESP <-> Store command translation (stateless)
 ├── async_tcp.py             # Non-blocking selector-based TCP server
 ├── sync_tcp.py              # Blocking single-client TCP server (reference)
 ├── resp.py                  # RESP protocol parser and encoder
+├── eviction/                # Eviction strategies (Strategy pattern)
+│   ├── base.py              #   EvictionPolicy ABC + EVICTION_SAMPLES
+│   ├── sizer.py             #   Sizer ABC + KeyCountSizer
+│   └── policies/            #   one policy per module
+│       ├── noeviction.py    #     NoEvictionPolicy (null object)
+│       └── random_policy.py #     RandomPolicy
 └── tests/                   # pytest test suite
     ├── test_store.py        # Store library API + thread-safety + background expiry
     ├── test_protocol.py     # RESP command layer over a Store
+    ├── test_eviction.py     # Sizer/policies + bounded-Store integration
     ├── test_async_tcp.py    # Server framing logic
     └── test_sync_tcp.py     # Legacy server integration smoke test
 ```

@@ -159,3 +159,53 @@ class TestReadFraming:
         assert sock.sent == b"+PONG\r\n"
         # The incomplete tail must remain buffered for the next read.
         assert server.read_buffers[sock] == partial
+
+
+# ---------------------------------------------------------------------------
+# Eviction through the SERVER path — a bounded Store injected into the server,
+# driven via real RESP SET commands over the fake socket.
+# ---------------------------------------------------------------------------
+
+class TestServerEviction:
+    def _bounded_server(self, max_size):
+        from store import Store
+        srv = AsyncTCPServer(store=Store(thread_safe=False, max_size=max_size,
+                                         eviction="random"))
+
+        class _NoopSel:
+            def unregister(self, _conn):
+                pass
+
+        srv.sel = _NoopSel()
+        return srv
+
+    def test_set_commands_respect_max_size(self):
+        srv = self._bounded_server(max_size=5)
+        # Fire 50 SET commands through the server's RESP path, pipelined.
+        chunk = b"".join(resp_array("SET", f"k{i}", str(i)) for i in range(50))
+        sock = FakeSock([chunk])
+        srv.read_buffers[sock] = b""
+        srv._read(sock)
+        # Every SET returned +OK ...
+        assert sock.sent == b"+OK\r\n" * 50
+        # ... but the bounded store never exceeded the limit.
+        assert len(srv.store) == 5
+        assert set(srv.store.expires) <= set(srv.store.data)
+
+    def test_get_after_eviction_returns_nil_or_value(self):
+        srv = self._bounded_server(max_size=3)
+        for i in range(10):
+            sock = FakeSock([resp_array("SET", f"k{i}", str(i))])
+            srv.read_buffers[sock] = b""
+            srv._read(sock)
+        # The last key set must still be retrievable via GET over the server.
+        sock = FakeSock([resp_array("GET", "k9")])
+        srv.read_buffers[sock] = b""
+        srv._read(sock)
+        assert sock.sent == b"$1\r\n9\r\n"
+        assert len(srv.store) == 3
+
+    def test_default_server_store_is_unbounded(self):
+        # Regression guard: the plain server must NOT be bounded.
+        srv = AsyncTCPServer()
+        assert srv.store._bounded is False
