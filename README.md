@@ -190,6 +190,43 @@ pytest test_sync_commands.py -v --tb=short
 
 ---
 
+## Contributing
+
+`master` and `staging` are protected — **nobody pushes to them directly**. All changes go through pull requests, and the merge path is one-directional: feature branch → `staging` → `master`.
+
+### Workflow
+
+1. **Branch off `staging`:**
+   ```bash
+   git checkout staging
+   git pull
+   git checkout -b your-feature-branch
+   ```
+2. **Make your changes** and commit them.
+3. **Run the test suite locally** before pushing — CI enforces the same gate:
+   ```bash
+   pytest
+   ```
+4. **Push your branch and open a PR into `staging`:**
+   ```bash
+   git push -u origin your-feature-branch
+   ```
+   Open the PR with **`staging`** as the base branch (never `master`).
+5. **Wait for review and merge.** The repository owner reviews and merges the PR into `staging`.
+6. **Promotion to `master`** is handled separately by the owner via a `staging` → `master` PR.
+
+### Merge requirements
+
+Every PR into `staging` and `master` must satisfy:
+
+- ✅ **CI passes** — the `test` GitHub Actions check runs `pytest` on every PR.
+- ✅ **Coverage ≥ 90%** — enforced by `--cov-fail-under=90` in `pytest.ini`. The build fails if application coverage drops below this.
+- ✅ **Code-owner review** — see [`.github/CODEOWNERS`](.github/CODEOWNERS).
+
+> Direct pushes, force-pushes, and branch deletions are blocked on `master` and `staging`. Only the repository owner can bypass these rules.
+
+---
+
 ## Project Structure
 
 ```
