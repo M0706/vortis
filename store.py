@@ -46,8 +46,10 @@ class Store:
     Thread-safety (``thread_safe``, default True): every public operation is
     guarded by a lock, so a client may call any method from any number of
     threads and each call is atomic — the client never has to think about
-    synchronization. This is a *per-command* guarantee; to make a *sequence* of
-    commands atomic, hold the boundary explicitly (see ``transaction()``).
+    synchronization. Note this is a *per-command* guarantee only: a *sequence*
+    of commands (e.g. a read-modify-write like get-then-set) is not atomic, as
+    another thread may run between the calls. If you need a multi-command
+    sequence to be atomic, guard it with your own lock around the calls.
 
     A caller that knows it is single-threaded (e.g. the event-loop server) can
     pass ``thread_safe=False`` to drop the lock for a faster, contention-free
