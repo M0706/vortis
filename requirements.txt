@@ -1,0 +1,5 @@
+# Test / dev tooling. The application itself has no third-party runtime
+# dependencies — it uses only the Python standard library.
+pytest==9.1.1
+pytest-cov==7.1.0
+coverage==7.14.3
