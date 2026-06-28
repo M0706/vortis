@@ -148,14 +148,13 @@ class TestBackgroundExpiry:
 
     def test_default_has_no_thread(self):
         s = Store()
-        assert s._thread is None  # passive-only by default — no background work
+        assert s._sweeper.is_running() is False  # passive-only by default
 
     def test_start_is_idempotent(self):
         s = Store(active_expiry=True, expiry_interval=0.05)
         try:
-            first = s._thread
             s.start_expiry()  # second call must not spawn another thread
-            assert s._thread is first
+            assert s._sweeper.is_running() is True
         finally:
             s.stop()
 
@@ -165,13 +164,12 @@ class TestBackgroundExpiry:
         s2 = Store(active_expiry=True, expiry_interval=0.05)
         s2.stop()
         s2.stop()  # double stop is fine
-        assert s2._thread is None
+        assert s2._sweeper.is_running() is False
 
     def test_context_manager_stops_thread(self):
         with Store(active_expiry=True, expiry_interval=0.05) as s:
-            assert s._thread is not None and s._thread.is_alive()
-            thread = s._thread
-        assert not thread.is_alive()  # exited on __exit__
+            assert s._sweeper.is_running() is True
+        assert s._sweeper.is_running() is False  # exited on __exit__
 
     def test_live_keys_survive_background_sweeps(self):
         with Store(active_expiry=True, expiry_interval=0.02) as s:
