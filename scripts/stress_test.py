@@ -284,6 +284,45 @@ def test_rmw_is_not_atomic(threads: int = 8, incr: int = 500) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Scenario 8 — bounded store stays within max_size under a writer storm
+# ---------------------------------------------------------------------------
+
+def test_bounded_store_under_load(threads: int = 16, per_thread: int = 20_000,
+                                  max_size: int = 1_000) -> None:
+    section(f"Scenario 8: bounded store (max_size={max_size:,}) + {threads} writers "
+            f"× {per_thread:,} — never exceeds the cap")
+    s = Store(max_size=max_size, eviction="random")
+    errors: list[Exception] = []
+    breaches = [0]
+
+    def worker(t: int) -> None:
+        try:
+            for i in range(per_thread):
+                s.set(f"t{t}-k{i}", "v")
+                if len(s) > max_size:
+                    breaches[0] += 1
+        except Exception as e:
+            errors.append(e)
+
+    start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        list(as_completed([pool.submit(worker, t) for t in range(threads)]))
+    elapsed = time.perf_counter() - start
+
+    total = threads * per_thread
+    check("no exceptions while evicting under concurrent writers", not errors,
+          f"{len(errors)} errors" if errors else "clean")
+    if errors:
+        check("first error detail", False, repr(errors[0]))
+    check("len(store) NEVER exceeded max_size", breaches[0] == 0,
+          f"{breaches[0]} breaches" if breaches[0] else "cap held every check")
+    check("final size within cap", len(s) <= max_size, f"len={len(s)}")
+    assert_invariant(s, "invariant holds after concurrent eviction")
+    print(f"  → {total:,} writes ({total // max_size}x the cap) in {elapsed:.3f}s "
+          f"= {total / elapsed:,.0f} ops/sec; final len={len(s)}")
+
+
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     print("Store library — in-depth stress test")
@@ -297,6 +336,7 @@ def main() -> int:
     test_lock_overhead()
     test_ttl_correctness_concurrent()
     test_rmw_is_not_atomic()
+    test_bounded_store_under_load()
     total = time.perf_counter() - t0
 
     section("RESULT")
