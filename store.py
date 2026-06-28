@@ -29,6 +29,8 @@ import threading
 import time
 from contextlib import nullcontext
 
+from eviction import EVICTION_SAMPLES, KeyCountSizer, make_policy
+
 # Active-expire tuning (mirrors Redis's activeExpireCycle constants).
 KEYS_PER_LOOP = 20       # ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP
 ACCEPTABLE_STALE = 0.25  # continue while >25% of the sample is expired
@@ -51,11 +53,20 @@ class Store:
     pass ``thread_safe=False`` to drop the lock for a faster, contention-free
     hot path. Enabling ``active_expiry`` forces the lock on regardless, because
     its background daemon thread mutates the keyspace concurrently.
+
+    Bounding size (``max_size``): by default the store is unbounded and grows
+    until you run out of memory. Pass ``max_size`` to cap it; once full, a new
+    write first evicts existing keys according to ``eviction`` (Redis's
+    evict-then-write). The limit is a **key count** (a future byte-based limiter
+    is pluggable via the Sizer strategy). When ``max_size`` is None there is no
+    eviction machinery at all, so the unbounded hot path is unchanged.
     """
 
     def __init__(self, thread_safe: bool = True, active_expiry: bool = False,
                  expiry_interval: float = 0.1,
-                 expiry_budget_ms: float = 1.0) -> None:
+                 expiry_budget_ms: float = 1.0,
+                 max_size: int | None = None,
+                 eviction: str = "random") -> None:
         # key -> (value, expires_at_monotonic_seconds | None)
         self.data: dict[str, tuple[str, float | None]] = {}
         # Secondary index: key -> expires_at, for keys that have a TTL only.
@@ -70,6 +81,16 @@ class Store:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
+        # Size bounding (off unless max_size is set). When off, none of the
+        # eviction machinery is consulted, so the hot path is untouched.
+        if max_size is not None and max_size <= 0:
+            raise ValueError("max_size must be a positive integer or None")
+        self._max_size = max_size
+        self._bounded = max_size is not None
+        if self._bounded:
+            self._sizer = KeyCountSizer()
+            self._policy = make_policy(eviction)
+
         # Thread-safety is the default guarantee. A background-expiry daemon
         # always needs the lock; a caller can otherwise opt out when it can
         # prove it is single-threaded (the server), paying zero locking cost.
@@ -83,9 +104,18 @@ class Store:
     # -- internal, lock-free (callers must already hold the lock) -----------
 
     def _del_key(self, key: str) -> None:
-        """Remove a key from both the keyspace and the TTL index."""
+        """Remove a key from both the keyspace and the TTL index.
+
+        This is the single removal chokepoint — delete, passive expiry, the
+        active sweep, and eviction all route through it — so notifying the
+        eviction policy here keeps any policy bookkeeping consistent no matter
+        how a key leaves.
+        """
+        existed = key in self.data
         self.data.pop(key, None)
         self.expires.pop(key, None)
+        if self._bounded and existed:
+            self._policy.note_remove(key)
 
     def _get_nolock(self, key: str) -> str | None:
         """Lookup with passive expiry, assuming the lock is already held."""
@@ -96,6 +126,8 @@ class Store:
         if expires_at is not None and time.monotonic() >= expires_at:
             self._del_key(key)
             return None
+        if self._bounded and self._policy.tracks_access:
+            self._policy.note_access(key)
         return value
 
     # -- core operations (public, lock-guarded) -----------------------------
@@ -118,11 +150,15 @@ class Store:
             expires_at = time.monotonic() + px / 1000
 
         with self._lock:
+            if self._bounded:
+                self._make_room_for(key, value)
             self.data[key] = (value, expires_at)
             if expires_at is not None:
                 self.expires[key] = expires_at
             else:
                 self.expires.pop(key, None)
+            if self._bounded:
+                self._policy.note_write(key)
 
     def get(self, key: str) -> str | None:
         """Return the value for ``key``, or None if missing or expired.
@@ -157,14 +193,16 @@ class Store:
 
     # -- active expiration --------------------------------------------------
 
-    def _sample_ttl_keys(self, n: int) -> list[str]:
-        """Return up to ``n`` keys from the TTL index, approximately at random.
+    def _sample(self, pool: dict, n: int) -> list[str]:
+        """Return up to ``n`` keys from ``pool``, approximately at random.
 
-        The naive approach — ``random.sample(list(self.expires), n)`` — copies
-        the *entire* index into a new list on every call. With a large keyspace
-        and an aggressive (looping) expire cycle, that O(N) allocation per
-        iteration dwarfs the O(n) useful work and defeats the whole point of
-        sampling.
+        Used both for active-expiry sampling (``pool=self.expires``) and for
+        eviction victim selection (``pool=self.data``).
+
+        The naive approach — ``random.sample(list(pool), n)`` — copies the
+        *entire* mapping into a new list on every call. With a large keyspace
+        and a looping cycle, that O(N) allocation per iteration dwarfs the O(n)
+        useful work and defeats the whole point of sampling.
 
         Instead we take a contiguous window of ``n`` keys starting at a random
         offset, advancing the dict iterator with ``itertools.islice`` (the skip
@@ -173,21 +211,47 @@ class Store:
 
         Trade-off: a contiguous slice is only *approximately* uniform (the keys
         are adjacent in insertion order, not independently drawn). That matches
-        the spirit of Redis's expiry sampling, which is also approximate — for
-        reclaiming expired keys we need decent coverage over time, not perfect
-        per-call uniformity.
+        the spirit of Redis's sampling (``maxmemory-samples``), which is also
+        approximate — we need decent coverage over time, not perfect per-call
+        uniformity.
 
-        Assumes the lock is already held (called from active_expire_cycle).
+        Assumes the lock is already held.
         """
-        size = len(self.expires)
+        size = len(pool)
         if size <= n:
-            return list(self.expires)
+            return list(pool)
         # Random starting offset; wrap by chaining the iterator with itself so a
         # window near the end still yields n keys.
         start = random.randint(0, size - 1)
-        window = itertools.islice(itertools.chain(self.expires, self.expires),
-                                  start, start + n)
+        window = itertools.islice(itertools.chain(pool, pool), start, start + n)
         return list(window)
+
+    def _make_room_for(self, key: str, value: str) -> None:
+        """Evict keys until ``key`` of given ``value`` fits within max_size.
+
+        Assumes the lock is held. Inserting over an existing key does not grow
+        the store, so nothing is evicted in that case. Stops early if the store
+        cannot be shrunk further (e.g. a policy that declines to evict).
+        """
+        if key in self.data:
+            return  # overwrite — size unchanged, no eviction needed
+        incoming = self._sizer.cost(key, value)
+        while self._sizer.current(self.data) + incoming > self._max_size:
+            if self._evict_one() is None:
+                break  # nothing evictable — let the write proceed
+
+    def _evict_one(self) -> str | None:
+        """Evict a single key per the policy. Returns the victim, or None.
+
+        Assumes the lock is held. Samples a small random set of keys and lets
+        the policy choose the victim — never scans the whole keyspace.
+        """
+        sample = self._sample(self.data, EVICTION_SAMPLES)
+        victim = self._policy.evict(sample)
+        if victim is None:
+            return None
+        self._del_key(victim)
+        return victim
 
     def active_expire_cycle(self, time_budget_ms: float = 1.0) -> int:
         """Reclaim expired keys cooperatively. Returns the number deleted.
@@ -216,7 +280,7 @@ class Store:
                 break  # out of time — leftover keys wait for the next tick
 
             with self._lock:
-                sample = self._sample_ttl_keys(KEYS_PER_LOOP)
+                sample = self._sample(self.expires, KEYS_PER_LOOP)
                 sample_size = len(sample)
 
                 expired = 0
