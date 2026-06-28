@@ -1,10 +1,16 @@
 # vortis
 
+[![PyPI](https://img.shields.io/pypi/v/vortis.svg)](https://pypi.org/project/vortis/)
+
 A fast in-memory key-value store with TTL, active expiry, and eviction — usable
 **as a library** (`from vortis import Store`) or **as a server**. The server
 speaks the [RESP protocol](https://redis.io/docs/reference/protocol-spec/), so
 standard Redis clients — `redis-cli`, `redis-py`, `redis-benchmark` — connect
 without modification.
+
+```bash
+pip install vortis
+```
 
 It is small and pure-Python (zero runtime dependencies). It implements a focused
 subset of Redis — strings with TTL, not the full command set — and keeps data in
@@ -385,9 +391,20 @@ python scripts/benchmark.py
 
 ## Installation
 
+From [PyPI](https://pypi.org/project/vortis/):
+
+```bash
+pip install vortis
+```
+
+That gives you both the importable library (`from vortis import Store`) and the
+`vortis` server command.
+
+To work on vortis itself, install from a clone in editable mode:
+
 ```bash
 pip install -e .          # the library + the `vortis` CLI
-pip install -e ".[dev]"   # also pytest/coverage for running the tests
+pip install -e ".[dev]"   # also the test + build/publish tooling
 ```
 
 ---
