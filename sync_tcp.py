@@ -5,7 +5,7 @@ HOST = "127.0.0.1"
 PORT = 65432
 
 
-def run_sync_tcp_server() -> None:
+def run_sync_tcp_server() -> None:  # pragma: no cover - blocking accept loop / real socket IO
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((HOST, PORT))

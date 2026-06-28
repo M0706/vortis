@@ -3,6 +3,7 @@ import time
 import pytest
 import sync_commands
 from sync_commands import process_input, store, expires
+from resp import parse_resp, encode
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +273,23 @@ class TestActiveExpire:
         sync_commands.active_expire_cycle(time_budget_ms=100)
         assert len(store) == 20
 
+    def test_time_budget_aborts_cycle(self, monkeypatch):
+        # With a zero/elapsed budget the cycle must bail before sampling,
+        # leaving keys for the next tick (covers the deadline break).
+        for i in range(30):
+            process_input(set_cmd(f"k{i}", "v", "EX", "5"))
+        real_monotonic = time.monotonic
+        # Jump the clock far past expiry AND past any deadline, so the very
+        # first deadline check trips.
+        monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() + 1000)
+        deleted = sync_commands.active_expire_cycle(time_budget_ms=0)
+        assert deleted == 0
+        assert len(expires) == 30  # nothing reclaimed — ran out of time first
+
+    def test_empty_expires_is_noop(self):
+        # No volatile keys -> while loop never entered, returns 0 cleanly.
+        assert sync_commands.active_expire_cycle(time_budget_ms=100) == 0
+
 
 # ---------------------------------------------------------------------------
 # parse_resp / protocol edge cases
@@ -297,3 +315,50 @@ class TestProtocol:
             process_input(b"\x00\xff\xfe")
         except Exception as e:
             pytest.fail(f"process_input raised on garbled input: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Benchmark/handshake commands (CLIENT / CONFIG / COMMAND)
+# ---------------------------------------------------------------------------
+
+class TestHandshakeCommands:
+    def test_client_setname_ok(self):
+        assert process_input(resp_array("CLIENT", "SETNAME", "x")) == b"+OK\r\n"
+
+    def test_config_get_returns_pair(self):
+        resp = process_input(resp_array("CONFIG", "GET", "maxmemory"))
+        # 2-element bulk array: the echoed key + an empty value.
+        assert resp == b"*2\r\n$9\r\nmaxmemory\r\n$0\r\n\r\n"
+
+    def test_config_non_get_returns_empty_array(self):
+        assert process_input(resp_array("CONFIG", "SET", "x", "1")) == b"*0\r\n"
+
+    def test_command_returns_empty_array(self):
+        assert process_input(resp_array("COMMAND")) == b"*0\r\n"
+
+
+# ---------------------------------------------------------------------------
+# resp.parse_resp / encode — protocol primitives
+# ---------------------------------------------------------------------------
+
+class TestRespParser:
+    def test_valid_array(self):
+        assert parse_resp(b"*2\r\n$4\r\nECHO\r\n$2\r\nhi\r\n") == ["ECHO", "hi"]
+
+    def test_inline_command_tokenised(self):
+        assert parse_resp(b"PING\r\n") == ["PING"]
+
+    def test_inline_empty_is_none(self):
+        assert parse_resp(b"\r\n") is None
+
+    def test_malformed_array_missing_dollar(self):
+        # Element header is not "$..." -> parser must reject (resp.py line 10).
+        assert parse_resp(b"*1\r\nXECHO\r\n") is None
+
+    def test_truncated_array_returns_none(self):
+        # count says 2 elements but only one provided -> IndexError -> None.
+        assert parse_resp(b"*2\r\n$4\r\nECHO\r\n") is None
+
+    def test_encode_simple_vs_bulk(self):
+        assert encode("OK", is_simple=True) == b"+OK\r\n"
+        assert encode("hi", is_simple=False) == b"$2\r\nhi\r\n"

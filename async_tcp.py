@@ -24,7 +24,7 @@ class AsyncTCPServer:
         del self.read_buffers[conn]
         conn.close()
 
-    def _accept(self, server: socket.socket) -> None:
+    def _accept(self, server: socket.socket) -> None:  # pragma: no cover - real socket IO
         conn, addr = server.accept()
         print(f"Connection from {addr}")
         conn.setblocking(False)
@@ -74,7 +74,7 @@ class AsyncTCPServer:
             # Inline command: everything up to and including the first \r\n
             return data.index(b"\r\n") + 2
 
-    def run(self) -> None:
+    def run(self) -> None:  # pragma: no cover - event loop / real socket IO
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((HOST, PORT))
